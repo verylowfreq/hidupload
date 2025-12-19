@@ -100,9 +100,10 @@ impl<'a> HidBootloader<'a> {
         let mut address = start_address;
         let mut pos_in_page: usize = 0;
 
+        println!("Program Start");
+
         while !remaining.is_empty() {
             if pos_in_page == 0 {
-                println!("Program Start");
                 self.send_without_response(Command::ProgramStart, address, 0, &[])?;
             }
 
@@ -120,13 +121,16 @@ impl<'a> HidBootloader<'a> {
             pos_in_page += write_len;
 
             if pos_in_page == FLUSH_PAGE_SIZE || remaining.len() == 0{
-                print!("*");
+                println!("Program address: 0x{:08x}", address);
                 self.send(Command::Flush, 0, 0, &[], TIMEOUT.mul_f64(64.0))?;
                 pos_in_page = 0;
             }
         }
 
         self.send(Command::Flush, 0, 0, &[], TIMEOUT.mul_f64(32.0))?;
+
+        println!("");
+        println!("OK.");
         Ok(())
     }
 

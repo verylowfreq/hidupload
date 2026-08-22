@@ -27,6 +27,11 @@ catupload --bin PATH --address ADDR [options]
 catupload --bin firmware.bin --address 0x08000000 --offset 0x2000 --verify
 ```
 
+```sh
+# Wait up to about 10 seconds for the device to re-enumerate after a bootloader reset
+catupload --bin firmware.bin --address 0x08000000 --retries 100 --retry-interval 100
+```
+
 ## Build
 ```sh
 cargo build --release
@@ -38,10 +43,17 @@ cargo build --release
 - `--offset OFFSET` Offset added to the base address (default: 0).
 - `--vid VID` USB VID (default: 0xf055).
 - `--pid PID` USB PID (default: 0x6585).
+- `--retries COUNT` Extra open attempts after the first failure (default: 0).
+- `--retry-interval MSEC` Interval between open attempts (default: 100).
 - `--verify` Verify with CRC16-CCITT after programming.
 
 ## Notes
 - Erase is always performed automatically before programming.
 - The erase range is expanded to 4 KB page boundaries as needed.
 - If multiple devices match the requested VID/PID, the tool aborts without programming.
+  This is never retried, because waiting cannot resolve it.
+- After a 1200bps touch from the Arduino IDE the device needs time to re-enumerate.
+  Pass `--retries 100 --retry-interval 100` to wait up to about 10 seconds for it to appear.
+  Retrying covers enumeration, opening, and claiming the interface, so it also rides out
+  the window where the device is visible but its driver is not bound yet.
 - The tool resets the device after a successful run.

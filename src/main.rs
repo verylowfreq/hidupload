@@ -40,6 +40,12 @@ struct Cli {
     /// PID (default 0x6585)
     #[arg(long, default_value = "0x6585", value_parser = parse_u16, value_name = "PID")]
     pid: u16,
+    /// Extra open attempts after the first failure (default 0)
+    #[arg(long, default_value = "0", value_parser = parse_u32, value_name = "COUNT")]
+    retries: u32,
+    /// Interval between open attempts in msec (default 100)
+    #[arg(long, default_value = "100", value_parser = parse_u32, value_name = "MSEC")]
+    retry_interval: u32,
     /// Verify CRC16 after programming
     #[arg(long, default_value_t = false)]
     verify: bool,
@@ -195,8 +201,30 @@ mod nusb_transport {
         endpoint_out: u8,
     }
 
+    /// Marks the "two boards are plugged in" case, which retrying cannot resolve.
+    #[derive(Debug)]
+    pub struct MultipleDevices {
+        pub vid: u16,
+        pub pid: u16,
+        pub count: usize,
+    }
+
+    impl std::fmt::Display for MultipleDevices {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            let Self { vid, pid, count } = self;
+            write!(
+                f,
+                "multiple matching USB devices found (vid=0x{vid:04x} pid=0x{pid:04x} count={count})"
+            )
+        }
+    }
+
+    impl std::error::Error for MultipleDevices {}
+
     impl NusbTransport {
-        pub fn open(vid: u16, pid: u16) -> Result<Self> {
+        /// `verbose` gates the per-device diagnostics so a retry loop does not
+        /// repeat the candidate dump on every attempt.
+        pub fn open(vid: u16, pid: u16, verbose: bool) -> Result<Self> {
             let devices: Vec<nusb::DeviceInfo> = nusb::list_devices()
                 .context("NUSB list_devices failed")?
                 .filter(|dev| dev.vendor_id() == vid && dev.product_id() == pid)
@@ -206,13 +234,16 @@ mod nusb_transport {
                 bail!("NUSB device not found");
             }
 
-            log_device_candidates(&devices);
+            if verbose || devices.len() > 1 {
+                log_device_candidates(&devices);
+            }
 
             if devices.len() > 1 {
-                bail!(
-                    "multiple matching USB devices found (vid=0x{vid:04x} pid=0x{pid:04x} count={})",
-                    devices.len()
-                );
+                return Err(Error::new(MultipleDevices {
+                    vid,
+                    pid,
+                    count: devices.len(),
+                }));
             }
 
             let mut preferred = Vec::with_capacity(devices.len());
@@ -229,8 +260,10 @@ mod nusb_transport {
 
             let mut last_err = None;
             for device_info in preferred {
-                log_device_attempt(&device_info);
-                let result = try_open_device(&device_info);
+                if verbose {
+                    log_device_attempt(&device_info);
+                }
+                let result = try_open_device(&device_info, verbose);
                 match result {
                     Ok(transport) => return Ok(transport),
                     Err(err) => last_err = Some(err),
@@ -297,7 +330,7 @@ mod nusb_transport {
         }
     }
 
-    fn try_open_device(device_info: &nusb::DeviceInfo) -> Result<NusbTransport> {
+    fn try_open_device(device_info: &nusb::DeviceInfo, verbose: bool) -> Result<NusbTransport> {
         let device = device_info.open().context("NUSB open failed")?;
         let config = device
             .active_configuration()
@@ -305,10 +338,12 @@ mod nusb_transport {
         let (interface_number, alt_setting, endpoint_in, endpoint_out) =
             find_vendor_bulk_interface(&config)
                 .context("Vendor bulk endpoints not found")?;
-        eprintln!(
-            "NUSB select interface={} alt={} in=0x{:02x} out=0x{:02x}",
-            interface_number, alt_setting, endpoint_in, endpoint_out
-        );
+        if verbose {
+            eprintln!(
+                "NUSB select interface={} alt={} in=0x{:02x} out=0x{:02x}",
+                interface_number, alt_setting, endpoint_in, endpoint_out
+            );
+        }
 
         let interface = device
             .claim_interface(interface_number)
@@ -486,10 +521,43 @@ fn erase_range(start_address: u32, size: usize) -> Result<(u32, usize)> {
     Ok((erase_start, erase_size))
 }
 
-fn open_transport(cli: &Cli) -> Result<Box<dyn BootTransport>> {
-    let transport = nusb_transport::NusbTransport::open(cli.vid, cli.pid)?;
+/// Errors that retrying cannot resolve, so the loop must give up at once.
+/// Two boards on the same VID/PID stay two boards no matter how long we wait.
+fn is_fatal_open_error(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<nusb_transport::MultipleDevices>()
+        .is_some()
+}
 
-    Ok(Box::new(transport))
+fn open_transport(cli: &Cli) -> Result<Box<dyn BootTransport>> {
+    let interval = Duration::from_millis(u64::from(cli.retry_interval));
+    let mut attempt: u32 = 0;
+
+    loop {
+        // Only the first attempt prints the per-device diagnostics, so a long
+        // retry run stays readable.
+        match nusb_transport::NusbTransport::open(cli.vid, cli.pid, attempt == 0) {
+            Ok(transport) => return Ok(Box::new(transport)),
+            Err(err) => {
+                if is_fatal_open_error(&err) {
+                    return Err(err);
+                }
+                if attempt >= cli.retries {
+                    return Err(if cli.retries == 0 {
+                        err
+                    } else {
+                        err.context(format!(
+                            "timed out waiting for target USB device ({} attempts, {} ms interval)",
+                            cli.retries + 1,
+                            cli.retry_interval
+                        ))
+                    });
+                }
+                attempt += 1;
+                eprintln!("Waiting for device... (retry {attempt}/{})", cli.retries);
+                std::thread::sleep(interval);
+            }
+        }
+    }
 }
 
 fn run() -> Result<()> {
@@ -555,5 +623,42 @@ fn main() {
     if let Err(err) = run() {
         eprintln!("Error: {err:?}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_fatal_open_error, nusb_transport::MultipleDevices};
+
+    /// The retry loop stops on this error instead of waiting out the full count.
+    #[test]
+    fn multiple_devices_is_fatal_but_a_missing_device_is_not() {
+        let multiple = anyhow::Error::new(MultipleDevices {
+            vid: 0xf055,
+            pid: 0x6585,
+            count: 2,
+        });
+        assert!(is_fatal_open_error(&multiple));
+
+        // The ordinary "not there yet" case must stay retryable, including once
+        // it has been wrapped by the timeout context.
+        let missing = anyhow::anyhow!("NUSB device not found");
+        assert!(!is_fatal_open_error(&missing));
+        assert!(!is_fatal_open_error(&missing.context("timed out")));
+    }
+
+    /// `main()` prints `Error: {err:?}`; this pins the `{err:?}` half, which must
+    /// stay identical to the message the old `bail!` produced.
+    #[test]
+    fn multiple_devices_keeps_its_message() {
+        let err = anyhow::Error::new(MultipleDevices {
+            vid: 0xf055,
+            pid: 0x6585,
+            count: 2,
+        });
+        assert_eq!(
+            format!("{err:?}"),
+            "multiple matching USB devices found (vid=0xf055 pid=0x6585 count=2)"
+        );
     }
 }

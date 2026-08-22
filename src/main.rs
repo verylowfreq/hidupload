@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 
 #[repr(u8)]
 #[derive(Copy, Clone, Debug)]
@@ -13,42 +13,135 @@ enum Command {
     ProgramStart = 3,
     ProgramAppend = 4,
     Flush = 5,
+    Read = 6,
     Reset = 7,
     Crc = 8,
+    ResetBootloader = 9,
 }
 
 const TIMEOUT: Duration = Duration::from_millis(100);
 const WRITE_BLOCK_SIZE: usize = 54;
 const FLUSH_PAGE_SIZE: usize = 4096;
 const PACKET_SIZE: usize = 64;
+/// The device clamps a READ request to this many bytes per packet.
+const READ_BLOCK_SIZE: usize = 62;
+
+/// Regions that must never be written or erased.
+///
+/// CH32V20x maps the main flash at both 0x0000_0000 and 0x0800_0000, so the
+/// bootloader has to be protected at both aliases or the guard is trivially
+/// sidestepped by using the other address.
+const PROTECTED_REGIONS: &[(u32, u32, &str)] = &[
+    (0x0800_0000, 0x4000, "CAT bootloader"),
+    (0x0000_0000, 0x4000, "CAT bootloader (alias)"),
+    (0x1fff_8000, 0x7000, "WCH system flash"),
+];
 
 #[derive(Debug, Parser)]
-#[command(author, version, about = "Bootloader uploader")]
+#[command(author, version, about = "CAT bootloader uploader")]
 struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+    /// VID (default 0xf055)
+    #[arg(long, global = true, default_value = "0xf055", value_parser = parse_u16, value_name = "VID")]
+    vid: u16,
+    /// PID (default 0x6585)
+    #[arg(long, global = true, default_value = "0x6585", value_parser = parse_u16, value_name = "PID")]
+    pid: u16,
+    /// Extra open attempts after the first failure (default 0)
+    #[arg(long, global = true, default_value = "0", value_parser = parse_u32, value_name = "COUNT")]
+    retries: u32,
+    /// Interval between open attempts in msec (default 100)
+    #[arg(long, global = true, default_value = "100", value_parser = parse_u32, value_name = "MSEC")]
+    retry_interval: u32,
+}
+
+#[derive(Debug, Subcommand)]
+enum Commands {
+    /// Write a binary to flash (erase, program, optionally verify, then reset)
+    Flash(FlashArgs),
+    /// Erase a range of flash
+    Erase(EraseArgs),
+    /// Read flash into a file
+    Read(ReadArgs),
+    /// Compare a binary against the device using CRC16
+    Verify(VerifyArgs),
+    /// Print the CRC16 of a range on the device
+    Crc(CrcArgs),
+    /// Connect, read IDENT and exit without touching flash
+    Probe,
+    /// Reset the device (the application starts)
+    Reset,
+    /// Reset the device and stay in the bootloader
+    #[command(alias = "reset_bootloader")]
+    ResetBootloader,
+    /// List matching USB devices without opening them
+    List,
+}
+
+#[derive(Debug, Args)]
+struct FlashArgs {
     /// Path to binary firmware
     #[arg(long, value_name = "PATH")]
     bin: PathBuf,
-    /// Base address (e.g. 0x08000000)
+    /// Base address (e.g. 0x08004000)
     #[arg(long, value_parser = parse_u32, value_name = "ADDR")]
     address: u32,
     /// Offset added to base address
     #[arg(long, default_value = "0", value_parser = parse_u32, value_name = "OFFSET")]
     offset: u32,
-    /// VID (default 0xf055)
-    #[arg(long, default_value = "0xf055", value_parser = parse_u16, value_name = "VID")]
-    vid: u16,
-    /// PID (default 0x6585)
-    #[arg(long, default_value = "0x6585", value_parser = parse_u16, value_name = "PID")]
-    pid: u16,
-    /// Extra open attempts after the first failure (default 0)
-    #[arg(long, default_value = "0", value_parser = parse_u32, value_name = "COUNT")]
-    retries: u32,
-    /// Interval between open attempts in msec (default 100)
-    #[arg(long, default_value = "100", value_parser = parse_u32, value_name = "MSEC")]
-    retry_interval: u32,
     /// Verify CRC16 after programming
     #[arg(long, default_value_t = false)]
     verify: bool,
+    /// Leave the device in the bootloader instead of resetting
+    #[arg(long, default_value_t = false)]
+    no_reset: bool,
+}
+
+#[derive(Debug, Args)]
+struct EraseArgs {
+    /// Base address, must be 4096-byte aligned
+    #[arg(long, value_parser = parse_u32, value_name = "ADDR")]
+    address: u32,
+    /// Number of bytes to erase, must be a multiple of 4096
+    #[arg(long, value_parser = parse_u32, value_name = "SIZE")]
+    size: u32,
+}
+
+#[derive(Debug, Args)]
+struct ReadArgs {
+    /// Base address to read from
+    #[arg(long, value_parser = parse_u32, value_name = "ADDR")]
+    address: u32,
+    /// Number of bytes to read
+    #[arg(long, value_parser = parse_u32, value_name = "SIZE")]
+    size: u32,
+    /// File to write the data to
+    #[arg(long, value_name = "PATH")]
+    out: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct VerifyArgs {
+    /// Path to binary firmware
+    #[arg(long, value_name = "PATH")]
+    bin: PathBuf,
+    /// Base address (e.g. 0x08004000)
+    #[arg(long, value_parser = parse_u32, value_name = "ADDR")]
+    address: u32,
+    /// Offset added to base address
+    #[arg(long, default_value = "0", value_parser = parse_u32, value_name = "OFFSET")]
+    offset: u32,
+}
+
+#[derive(Debug, Args)]
+struct CrcArgs {
+    /// Base address
+    #[arg(long, value_parser = parse_u32, value_name = "ADDR")]
+    address: u32,
+    /// Number of bytes
+    #[arg(long, value_parser = parse_u32, value_name = "SIZE")]
+    size: u32,
 }
 
 trait BootTransport {
@@ -157,19 +250,61 @@ impl Bootloader {
         Ok(())
     }
 
-    fn verify(&self, start_address: u32, data: &[u8]) -> Result<bool> {
-        let expected = crc16_ccitt(data);
-        let timeout = TIMEOUT.mul_f64((data.len() as f64 / 1024.0).max(1.0));
-        let resp = self.send(Command::Crc, start_address, data.len() as u32, &[], timeout)?;
-        let actual = u16::from_le_bytes([
+    fn read(&self, start_address: u32, size: usize) -> Result<Vec<u8>> {
+        let mut data = Vec::with_capacity(size);
+
+        while data.len() < size {
+            let address = start_address.wrapping_add(data.len() as u32);
+            let want = (size - data.len()).min(READ_BLOCK_SIZE);
+            let resp = self.send(Command::Read, address, want as u32, &[], TIMEOUT)?;
+
+            if resp.get(0).copied().unwrap_or(0) != 0x01 {
+                bail!("Read failed (addr=0x{address:08x})");
+            }
+
+            // The device silently clamps the request, so trust the length it
+            // reports rather than the length we asked for.
+            let got = *resp.get(1).unwrap_or(&0) as usize;
+            if got == 0 {
+                bail!("READ returned no data (addr=0x{address:08x})");
+            }
+            let end = got.saturating_add(2).min(resp.len());
+            data.extend_from_slice(&resp[2..end]);
+
+            if end < got + 2 {
+                bail!("READ response was truncated (addr=0x{address:08x})");
+            }
+        }
+
+        data.truncate(size);
+        Ok(data)
+    }
+
+    fn crc(&self, start_address: u32, size: u32) -> Result<u16> {
+        let timeout = TIMEOUT.mul_f64((size as f64 / 1024.0).max(1.0));
+        let resp = self.send(Command::Crc, start_address, size, &[], timeout)?;
+        Ok(u16::from_le_bytes([
             resp.get(2).copied().unwrap_or(0),
             resp.get(3).copied().unwrap_or(0),
-        ]);
+        ]))
+    }
+
+    fn verify(&self, start_address: u32, data: &[u8]) -> Result<bool> {
+        let expected = crc16_ccitt(data);
+        let actual = self.crc(start_address, data.len() as u32)?;
         Ok(expected == actual)
     }
 
     fn reset(&self) {
         let _resp = self.send(Command::Reset, 0, 0, &[], TIMEOUT);
+    }
+
+    /// Resets into the bootloader instead of the application.
+    ///
+    /// Like `reset`, the device reboots before answering, so there is no
+    /// response to wait for and a failure here is not an error.
+    fn reset_bootloader(&self) {
+        let _resp = self.send(Command::ResetBootloader, 0, 0, &[], TIMEOUT);
     }
 
     fn send(
@@ -199,6 +334,25 @@ mod nusb_transport {
         interface: nusb::Interface,
         endpoint_in: u8,
         endpoint_out: u8,
+    }
+
+    /// Enumerates matching devices without opening any of them.
+    ///
+    /// Seeing more than one is a valid result here — this is the diagnostic for
+    /// the multiple-match abort, so it neither retries nor fails on a duplicate.
+    pub fn list_devices(vid: u16, pid: u16) -> Result<()> {
+        let devices: Vec<nusb::DeviceInfo> = nusb::list_devices()
+            .context("NUSB list_devices failed")?
+            .filter(|dev| dev.vendor_id() == vid && dev.product_id() == pid)
+            .collect();
+
+        println!("Device: vid=0x{vid:04x} pid=0x{pid:04x}");
+        if devices.is_empty() {
+            println!("No matching device.");
+        } else {
+            log_device_candidates(&devices);
+        }
+        Ok(())
     }
 
     /// Marks the "two boards are plugged in" case, which retrying cannot resolve.
@@ -521,6 +675,30 @@ fn erase_range(start_address: u32, size: usize) -> Result<(u32, usize)> {
     Ok((erase_start, erase_size))
 }
 
+/// Refuses an operation that would touch a region listed in `PROTECTED_REGIONS`.
+///
+/// The device answers a misaligned or out-of-range erase with RESP_OK and
+/// silently does nothing, so this host-side check is the only guard there is.
+fn check_protected(start_address: u32, size: u32, op: &str) -> Result<()> {
+    if size == 0 {
+        return Ok(());
+    }
+    let end = start_address
+        .checked_add(size)
+        .context("address + size overflow")?;
+
+    for &(base, len, name) in PROTECTED_REGIONS {
+        let region_end = base + len;
+        if start_address < region_end && base < end {
+            bail!(
+                "refusing to {op} 0x{start_address:08x}..0x{end:08x}: \
+                 overlaps {name} (0x{base:08x}..0x{region_end:08x})"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Errors that retrying cannot resolve, so the loop must give up at once.
 /// Two boards on the same VID/PID stay two boards no matter how long we wait.
 fn is_fatal_open_error(err: &anyhow::Error) -> bool {
@@ -560,33 +738,50 @@ fn open_transport(cli: &Cli) -> Result<Box<dyn BootTransport>> {
     }
 }
 
-fn run() -> Result<()> {
-    let cli = Cli::parse();
-    let start_address = cli
-        .address
-        .checked_add(cli.offset)
+/// Reads a firmware file and works out where it will land.
+fn load_firmware(bin: &PathBuf, address: u32, offset: u32) -> Result<(Vec<u8>, u32)> {
+    let start_address = address
+        .checked_add(offset)
         .context("address + offset overflow")?;
 
-    let firmware = fs::read(&cli.bin)
-        .with_context(|| format!("failed to read firmware: {}", cli.bin.display()))?;
+    let firmware =
+        fs::read(bin).with_context(|| format!("failed to read firmware: {}", bin.display()))?;
 
     if firmware.is_empty() {
-        bail!("firmware is empty: {}", cli.bin.display());
+        bail!("firmware is empty: {}", bin.display());
     }
 
+    Ok((firmware, start_address))
+}
+
+/// Announces the target, opens it (retrying per the global options) and reads IDENT.
+fn connect(cli: &Cli) -> Result<Bootloader> {
     println!(
         "Device: vid=0x{vid:04x} pid=0x{pid:04x}",
         vid = cli.vid,
         pid = cli.pid
     );
 
-    let transport = open_transport(&cli)?;
+    let transport = open_transport(cli)?;
     let boot = Bootloader::new(transport);
     println!("Transport: {}", boot.transport_kind());
     let ident = boot.get_ident()?;
     println!("Ident: {ident}");
+    Ok(boot)
+}
 
+fn cmd_flash(cli: &Cli, args: &FlashArgs) -> Result<()> {
+    let (firmware, start_address) = load_firmware(&args.bin, args.address, args.offset)?;
     let (erase_start, erase_size) = erase_range(start_address, firmware.len())?;
+
+    // Check before opening the device so a refused write costs nothing, and
+    // check the widened erase range too since it can reach further than the
+    // firmware itself.
+    check_protected(start_address, firmware.len() as u32, "write")?;
+    check_protected(erase_start, erase_size as u32, "erase")?;
+
+    let boot = connect(cli)?;
+
     println!(
         "Erase: addr=0x{start:08x} size={size} ({} KB)",
         erase_size / 1024,
@@ -603,20 +798,124 @@ fn run() -> Result<()> {
     boot.write(start_address, &firmware)?;
     println!("Write done.");
 
-    if cli.verify {
+    if args.verify {
         println!("CRC16 verify...");
-        let ok = boot.verify(start_address, &firmware)?;
-        if ok {
+        if boot.verify(start_address, &firmware)? {
             println!("Verify OK");
         } else {
             bail!("Verify NG (CRC mismatch)");
         }
     }
 
-    println!("Resetting device...");
-    boot.reset();
+    if args.no_reset {
+        println!("Leaving device in the bootloader.");
+    } else {
+        println!("Resetting device...");
+        boot.reset();
+    }
 
     Ok(())
+}
+
+fn cmd_erase(cli: &Cli, args: &EraseArgs) -> Result<()> {
+    let page = FLUSH_PAGE_SIZE as u32;
+    if args.address % page != 0 || args.size % page != 0 {
+        // Do not widen the range on the user's behalf: they named it, and the
+        // device would report success while erasing nothing.
+        let (aligned_start, aligned_size) = erase_range(args.address, args.size as usize)?;
+        bail!(
+            "erase requires address and size to be {page}-byte aligned \
+             (try --address 0x{aligned_start:08x} --size 0x{aligned_size:x})"
+        );
+    }
+    check_protected(args.address, args.size, "erase")?;
+
+    let boot = connect(cli)?;
+    println!(
+        "Erase: addr=0x{start:08x} size={size} ({} KB)",
+        args.size / 1024,
+        start = args.address,
+        size = args.size
+    );
+    boot.erase(args.address, args.size as usize)?;
+    println!("Erase done.");
+    Ok(())
+}
+
+fn cmd_read(cli: &Cli, args: &ReadArgs) -> Result<()> {
+    if args.size == 0 {
+        bail!("--size must be greater than 0");
+    }
+
+    let boot = connect(cli)?;
+    println!(
+        "Read: addr=0x{start:08x} size={size} bytes",
+        start = args.address,
+        size = args.size
+    );
+    let data = boot.read(args.address, args.size as usize)?;
+
+    fs::write(&args.out, &data)
+        .with_context(|| format!("failed to write output: {}", args.out.display()))?;
+    println!("Wrote {} bytes to {}", data.len(), args.out.display());
+    Ok(())
+}
+
+fn cmd_verify(cli: &Cli, args: &VerifyArgs) -> Result<()> {
+    let (firmware, start_address) = load_firmware(&args.bin, args.address, args.offset)?;
+
+    let boot = connect(cli)?;
+    println!(
+        "Verify: addr=0x{start:08x} size={} bytes",
+        firmware.len(),
+        start = start_address
+    );
+    if boot.verify(start_address, &firmware)? {
+        println!("Verify OK");
+        Ok(())
+    } else {
+        bail!("Verify NG (CRC mismatch)");
+    }
+}
+
+fn cmd_crc(cli: &Cli, args: &CrcArgs) -> Result<()> {
+    let boot = connect(cli)?;
+    let crc = boot.crc(args.address, args.size)?;
+    println!(
+        "CRC16: 0x{crc:04x} (addr=0x{start:08x} size={size})",
+        start = args.address,
+        size = args.size
+    );
+    Ok(())
+}
+
+fn run() -> Result<()> {
+    let cli = Cli::parse();
+
+    match &cli.command {
+        Commands::Flash(args) => cmd_flash(&cli, args),
+        Commands::Erase(args) => cmd_erase(&cli, args),
+        Commands::Read(args) => cmd_read(&cli, args),
+        Commands::Verify(args) => cmd_verify(&cli, args),
+        Commands::Crc(args) => cmd_crc(&cli, args),
+        Commands::Probe => {
+            connect(&cli)?;
+            Ok(())
+        }
+        Commands::Reset => {
+            let boot = connect(&cli)?;
+            println!("Resetting device...");
+            boot.reset();
+            Ok(())
+        }
+        Commands::ResetBootloader => {
+            let boot = connect(&cli)?;
+            println!("Resetting into the bootloader...");
+            boot.reset_bootloader();
+            Ok(())
+        }
+        Commands::List => nusb_transport::list_devices(cli.vid, cli.pid),
+    }
 }
 
 fn main() {
@@ -628,7 +927,32 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_fatal_open_error, nusb_transport::MultipleDevices};
+    use super::{check_protected, is_fatal_open_error, nusb_transport::MultipleDevices};
+
+    /// The device reports success for an erase it silently skipped, so this
+    /// check is the only thing standing between a typo and a bricked board.
+    #[test]
+    fn protected_regions_are_refused() {
+        // Whole region, and the 0x0000_0000 alias of the same flash.
+        assert!(check_protected(0x0800_0000, 0x1000, "erase").is_err());
+        assert!(check_protected(0x0000_0000, 0x1000, "erase").is_err());
+        assert!(check_protected(0x1fff_8000, 0x1000, "erase").is_err());
+
+        // Partial overlaps from either side must be caught, not just containment.
+        assert!(check_protected(0x0800_3000, 0x2000, "erase").is_err());
+        assert!(check_protected(0x0800_3fff, 1, "write").is_err());
+    }
+
+    #[test]
+    fn addresses_outside_protected_regions_are_allowed() {
+        // First byte past the bootloader: the boundary itself must be usable.
+        assert!(check_protected(0x0800_4000, 0x1000, "erase").is_ok());
+        assert!(check_protected(0x0000_4000, 0x1000, "erase").is_ok());
+        // Butting up against the start of a region from below.
+        assert!(check_protected(0x1fff_7000, 0x1000, "erase").is_ok());
+        // A zero-length range overlaps nothing.
+        assert!(check_protected(0x0800_0000, 0, "write").is_ok());
+    }
 
     /// The retry loop stops on this error instead of waiting out the full count.
     #[test]

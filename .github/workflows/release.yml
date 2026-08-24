@@ -1,0 +1,133 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate release tag
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Check tag against Cargo.toml
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "catupload") | .version')"
+          if [[ "$TAG" != "v$version" ]]; then
+            echo "Tag '$TAG' does not match Cargo.toml version '$version' (expected 'v$version')." >&2
+            exit 1
+          fi
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Install Rust target
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustup target add "${{ matrix.target }}"
+
+      - name: Test
+        shell: bash
+        run: cargo test --locked --release --target "${{ matrix.target }}"
+
+      - name: Build
+        shell: bash
+        run: cargo build --locked --release --target "${{ matrix.target }}"
+
+      - name: Package Windows archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          $stage = Join-Path $env:RUNNER_TEMP "catupload-package"
+          New-Item -ItemType Directory -Force -Path $stage, "dist" | Out-Null
+          Copy-Item "target/$env:TARGET/release/catupload.exe" $stage
+          Copy-Item "README.md", "LICENSE" $stage
+          Compress-Archive `
+            -Path "$stage/*" `
+            -DestinationPath "dist/catupload-$env:TARGET-$env:TAG.zip"
+
+      - name: Package Unix archive
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/catupload-package"
+          archive="$GITHUB_WORKSPACE/dist/catupload-$TARGET-$TAG.tar.gz"
+          mkdir -p "$stage" dist
+          cp "target/$TARGET/release/catupload" README.md LICENSE "$stage/"
+          tar -C "$stage" -czf "$archive" .
+
+      - name: Upload packaged binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Download packaged binaries
+        uses: actions/download-artifact@v5
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create release and upload archives
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" dist/* \
+            --verify-tag \
+            --generate-notes

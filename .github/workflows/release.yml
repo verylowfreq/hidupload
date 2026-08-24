@@ -75,11 +75,12 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           $stage = Join-Path $env:RUNNER_TEMP "catupload-package"
-          New-Item -ItemType Directory -Force -Path $stage, "dist" | Out-Null
-          Copy-Item "target/$env:TARGET/release/catupload.exe" $stage
-          Copy-Item "README.md", "LICENSE" $stage
+          $packageDir = Join-Path $stage "catupload"
+          New-Item -ItemType Directory -Force -Path $packageDir, "dist" | Out-Null
+          Copy-Item "target/$env:TARGET/release/catupload.exe" $packageDir
+          Copy-Item "README.md", "LICENSE" $packageDir
           Compress-Archive `
-            -Path "$stage/*" `
+            -Path $packageDir `
             -DestinationPath "dist/catupload-$env:TARGET-$env:TAG.zip"
 
       - name: Package Unix archive
@@ -91,10 +92,11 @@ jobs:
         run: |
           set -euo pipefail
           stage="$RUNNER_TEMP/catupload-package"
+          package_dir="$stage/catupload"
           archive="$GITHUB_WORKSPACE/dist/catupload-$TARGET-$TAG.tar.gz"
-          mkdir -p "$stage" dist
-          cp "target/$TARGET/release/catupload" README.md LICENSE "$stage/"
-          tar -C "$stage" -czf "$archive" .
+          mkdir -p "$package_dir" dist
+          cp "target/$TARGET/release/catupload" README.md LICENSE "$package_dir/"
+          tar -C "$stage" -czf "$archive" catupload
 
       - name: Upload packaged binary
         uses: actions/upload-artifact@v4
